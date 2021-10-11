@@ -1,9 +1,11 @@
 pub mod mdbx;
 pub mod remote;
 pub mod server;
+pub mod tableobject;
 pub mod tables;
 pub mod traits;
 
+pub use tableobject::*;
 pub use traits::{DupSort, Table, TableDecode, TableEncode, TableObject};
 
 use crate::kv::tables::CHAINDATA_TABLES;
