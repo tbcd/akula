@@ -1,4 +1,7 @@
-use crate::models::{BlockHeader, BlockNumber};
+use crate::{
+    chain::difficulty::canonical_difficulty,
+    models::{BlockHeader, BlockNumber, ChainSpec, EMPTY_LIST_HASH},
+};
 
 pub fn verify_link_by_parent_hash(child: &BlockHeader, parent: &BlockHeader) -> bool {
     let given_parent_hash = child.parent_hash;
@@ -18,9 +21,21 @@ pub fn verify_link_timestamps(child: &BlockHeader, parent: &BlockHeader) -> bool
     parent_timestamp < child_timestamp
 }
 
-pub fn verify_link_difficulties(_child: &BlockHeader, _parent: &BlockHeader) -> bool {
-    // TODO: verify_link_difficulties
-    true
+pub fn verify_link_difficulties(
+    child: &BlockHeader,
+    parent: &BlockHeader,
+    chain_spec: &ChainSpec,
+) -> bool {
+    let given_child_difficulty = child.difficulty;
+    let expected_child_difficulty = canonical_difficulty(
+        child.number,
+        child.timestamp,
+        parent.difficulty,
+        parent.timestamp,
+        parent.ommers_hash != EMPTY_LIST_HASH,
+        chain_spec,
+    );
+    given_child_difficulty == expected_child_difficulty
 }
 
 pub fn verify_link_pow(_child: &BlockHeader, _parent: &BlockHeader) -> bool {
@@ -79,9 +94,9 @@ pub fn verify_slice_timestamps(headers: &[BlockHeader], max_timestamp: u64) -> b
 }
 
 /// Verify that difficulty field is calculated properly.
-pub fn verify_slice_difficulties(_headers: &[BlockHeader]) -> bool {
-    // TODO: verify_slice_difficulties
-    true
+pub fn verify_slice_difficulties(headers: &[BlockHeader], chain_spec: &ChainSpec) -> bool {
+    enumerate_sequential_pairs(headers)
+        .all(|(parent, child)| verify_link_difficulties(child, parent, chain_spec))
 }
 
 /// Verify the headers proof-of-work.
