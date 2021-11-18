@@ -6,7 +6,7 @@ use crate::{
     models::{BlockHeader as Header, BlockNumber},
     sentry::{
         messages::{BlockHeadersMessage, EthMessageId, Message},
-        sentry_client_reactor::SentryClientReactor,
+        sentry_client_reactor::*,
     },
 };
 use futures_core::Stream;
@@ -25,7 +25,7 @@ type BlockHeadersMessageStream = Pin<Box<dyn Stream<Item = BlockHeadersMessage> 
 /// Receives the slices, and sets Downloaded status.
 pub struct FetchReceiveStage {
     header_slices: Arc<HeaderSlices>,
-    sentry: Arc<RwLock<SentryClientReactor>>,
+    sentry: SentryClientReactorShared,
     is_over: Arc<AtomicBool>,
     message_stream: Mutex<Option<BlockHeadersMessageStream>>,
 }
@@ -46,7 +46,7 @@ impl CanProceed {
 }
 
 impl FetchReceiveStage {
-    pub fn new(header_slices: Arc<HeaderSlices>, sentry: Arc<RwLock<SentryClientReactor>>) -> Self {
+    pub fn new(header_slices: Arc<HeaderSlices>, sentry: SentryClientReactorShared) -> Self {
         Self {
             header_slices,
             sentry,
@@ -59,7 +59,8 @@ impl FetchReceiveStage {
         debug!("FetchReceiveStage: start");
         let mut message_stream = self.message_stream.try_lock()?;
         if message_stream.is_none() {
-            *message_stream = Some(self.receive_headers()?);
+            let sentry = self.sentry.read().await;
+            *message_stream = Some(self.receive_headers(&sentry)?);
         }
 
         let message_result = message_stream.as_mut().unwrap().next().await;
@@ -123,11 +124,11 @@ impl FetchReceiveStage {
         }
     }
 
-    fn receive_headers(&self) -> anyhow::Result<BlockHeadersMessageStream> {
-        let in_stream = self
-            .sentry
-            .read()
-            .receive_messages(EthMessageId::BlockHeaders)?;
+    fn receive_headers(
+        &self,
+        sentry: &SentryClientReactor,
+    ) -> anyhow::Result<BlockHeadersMessageStream> {
+        let in_stream = sentry.receive_messages(EthMessageId::BlockHeaders)?;
 
         let out_stream = in_stream.map(|message| match message {
             Message::BlockHeaders(message) => message,

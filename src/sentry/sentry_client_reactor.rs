@@ -18,8 +18,10 @@ use tokio_stream::{
 };
 use tracing::*;
 
+pub type SentryClientReactorShared = Arc<tokio::sync::RwLock<SentryClientReactor>>;
+
 pub struct SentryClientReactor {
-    send_message_sender: mpsc::Sender<SendMessageCommand>,
+    send_message_sender: mpsc::Sender<SentryCommand>,
     receive_messages_senders: Arc<RwLock<HashMap<EthMessageId, broadcast::Sender<Message>>>>,
     event_loop: Mutex<Option<SentryClientReactorEventLoop>>,
     event_loop_handle: Option<JoinHandle<()>>,
@@ -28,13 +30,19 @@ pub struct SentryClientReactor {
 
 struct SentryClientReactorEventLoop {
     sentry_connector: sentry_client_connector::SentryClientConnectorStream,
-    send_message_receiver: mpsc::Receiver<SendMessageCommand>,
+    send_message_receiver: mpsc::Receiver<SentryCommand>,
     receive_messages_senders: Arc<RwLock<HashMap<EthMessageId, broadcast::Sender<Message>>>>,
     stop_signal_receiver: mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Debug)]
-struct SendMessageCommand {
+enum SentryCommand {
+    SendMessage(SendMessageParams),
+    PenalizePeer(PeerId),
+}
+
+#[derive(Clone, Debug)]
+struct SendMessageParams {
     message: Message,
     peer_filter: PeerFilter,
 }
@@ -55,7 +63,7 @@ impl std::error::Error for SendMessageError {}
 
 impl SentryClientReactor {
     pub fn new(sentry_connector: sentry_client_connector::SentryClientConnectorStream) -> Self {
-        let (send_message_sender, send_message_receiver) = mpsc::channel::<SendMessageCommand>(1);
+        let (send_message_sender, send_message_receiver) = mpsc::channel::<SentryCommand>(1);
 
         let mut receive_messages_senders =
             HashMap::<EthMessageId, broadcast::Sender<Message>>::new();
@@ -113,20 +121,24 @@ impl SentryClientReactor {
         }
     }
 
+    pub async fn penalize_peer(&self, peer_id: PeerId) -> anyhow::Result<()> {
+        let command = SentryCommand::PenalizePeer(peer_id);
+        let result = self.send_message_sender.send(command).await;
+        result.map_err(|_| anyhow::Error::new(SendMessageError::ReactorStopped))
+    }
+
     pub async fn send_message(
         &self,
         message: Message,
         peer_filter: PeerFilter,
     ) -> anyhow::Result<()> {
-        let command = SendMessageCommand {
+        let params = SendMessageParams {
             message,
             peer_filter,
         };
-        if self.send_message_sender.send(command).await.is_err() {
-            return Err(anyhow::Error::new(SendMessageError::ReactorStopped));
-        }
-
-        Ok(())
+        let command = SentryCommand::SendMessage(params);
+        let result = self.send_message_sender.send(command).await;
+        result.map_err(|_| anyhow::Error::new(SendMessageError::ReactorStopped))
     }
 
     pub fn try_send_message(
@@ -134,10 +146,11 @@ impl SentryClientReactor {
         message: Message,
         peer_filter: PeerFilter,
     ) -> anyhow::Result<()> {
-        let command = SendMessageCommand {
+        let params = SendMessageParams {
             message,
             peer_filter,
         };
+        let command = SentryCommand::SendMessage(params);
         let result = self.send_message_sender.try_send(command);
         match result {
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -265,8 +278,25 @@ mod stream_factory {
         Box::pin(receive_stream.map_ok(EventLoopStreamResult::Receive))
     }
 
+    async fn send_sentry_command(
+        command: SentryCommand,
+        sentry: &mut Box<dyn SentryClient>,
+    ) -> anyhow::Result<u32> {
+        match command {
+            SentryCommand::SendMessage(params) => {
+                sentry
+                    .send_message(params.message, params.peer_filter)
+                    .await
+            }
+            SentryCommand::PenalizePeer(peer_id) => {
+                // this is sent to a single peer (1)
+                sentry.penalize_peer(peer_id).await.map(|_| 1)
+            }
+        }
+    }
+
     fn make_send_stream(
-        send_message_receiver: Arc<Mutex<mpsc::Receiver<SendMessageCommand>>>,
+        send_message_receiver: Arc<Mutex<mpsc::Receiver<SentryCommand>>>,
         mut sentry: Box<dyn SentryClient>,
     ) -> EventLoopStream {
         let send_stream = async_stream::stream! {
@@ -279,7 +309,7 @@ mod stream_factory {
 
             let mut receiver = receiver_lock_result.ok().unwrap();
             while let Some(command) = receiver.recv().await {
-                let send_result = sentry.send_message(command.message, command.peer_filter).await;
+                let send_result = send_sentry_command(command, &mut sentry).await;
                 yield send_result;
             }
         };
@@ -288,7 +318,7 @@ mod stream_factory {
 
     pub(super) async fn make_sentry_streams(
         mut sentry: Box<dyn SentryClient>,
-        send_message_receiver: Arc<Mutex<mpsc::Receiver<SendMessageCommand>>>,
+        send_message_receiver: Arc<Mutex<mpsc::Receiver<SentryCommand>>>,
         receive_messages_senders_dropper: EventLoopReceiveMessagesSendersDropper,
     ) -> anyhow::Result<(EventLoopStream, EventLoopStream)> {
         // subscribe to incoming messages
@@ -354,14 +384,14 @@ impl SentryClientReactorEventLoop {
                     match result {
                         Ok(EventLoopStreamResult::Send(sent_peers_count)) => {
                             debug!(
-                                "SentryClientReactor.EventLoop sent message to {:?} peers",
+                                "SentryClientReactor.EventLoop sent command to {:?} peers",
                                 sent_peers_count
                             );
                         }
                         Ok(_) => panic!("unexpected result {:?}", result),
                         Err(error) => {
                             error!(
-                                "SentryClientReactor.EventLoop sentry.send_message error: {}",
+                                "SentryClientReactor.EventLoop send_sentry_command error: {}",
                                 error
                             );
                             if sentry_client_connector::is_disconnect_error(&error) {

@@ -23,6 +23,8 @@ pub enum HeaderSliceStatus {
     VerifiedInternally,
     // headers of the slice and linked in a proper way to a known verified header
     Verified,
+    // verification failed
+    Invalid,
     // saved in the database
     Saved,
 }
